@@ -73,8 +73,12 @@ Thumbs.db
 *.sw?
 
 # Project specific data and outputs
-data/
+data/*
+!data/processed/
+data/processed/*
+!data/processed/consolidated_kpis.parquet
 *.joblib
+!src/models/distress_classifier.joblib
 *.pkl
 *.pickle
 *.log
