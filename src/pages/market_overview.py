@@ -146,8 +146,22 @@ DATA_PATH = PROJECT_ROOT / "data" / "processed" / "consolidated_kpis.parquet"
 
 
 @st.cache_data
-def load_data():
-    df = pd.read_parquet(DATA_PATH)
+def load_data(file_path: Path, mtime: float):
+    df = pd.read_parquet(file_path)
+    
+    # Filter out companies missing >= 15 KPIs (SPACs, ETFs, IFRS, and inactive shell companies)
+    kpis = [
+        "revenue", "cost_of_revenue", "gross_profit", "operating_income", 
+        "depreciation_amortization", "income_before_tax", "net_income", 
+        "total_assets", "total_liabilities", "equity", "receivables", 
+        "payables", "inventory", "operating_cash_flow", "investing_cash_flow", 
+        "financing_cash_flow", "capex", "ebitda"
+    ]
+    kpis_present = [col for col in kpis if col in df.columns]
+    company_na_counts = df.groupby("company_name")[kpis_present].apply(lambda x: x.isna().all().sum())
+    valid_companies = company_na_counts[company_na_counts < 15].index
+    df = df[df["company_name"].isin(valid_companies)].copy()
+
     df["report_period"] = pd.to_datetime(df["report_period"])
     df["receivables"] = df["receivables"].fillna(0.0)
     df["inventory"] = df["inventory"].fillna(0.0)
@@ -171,7 +185,7 @@ def load_data():
     return df
 
 
-df = load_data()
+df = load_data(DATA_PATH, DATA_PATH.stat().st_mtime if DATA_PATH.exists() else 0.0)
 
 all_quarters = sorted(df["quarter_label"].unique(), reverse=True)
 
@@ -247,7 +261,7 @@ RANK_HIGHER_BETTER = {
 }
 
 @st.cache_data
-def compute_deltas(rank_col: str, current_q: str, prev_q: str):
+def compute_deltas(rank_col: str, current_q: str, prev_q: str, mtime: float):
     curr_df = df[df["quarter_label"] == current_q][["company_name", rank_col]].copy()
     prev_df = df[df["quarter_label"] == prev_q][["company_name", rank_col]].copy()
 
@@ -272,7 +286,7 @@ def compute_deltas(rank_col: str, current_q: str, prev_q: str):
 
 
 @st.cache_data
-def compute_consistency(rank_col: str, last_4_quarters: tuple):
+def compute_consistency(rank_col: str, last_4_quarters: tuple, mtime: float):
     subset = df[df["quarter_label"].isin(last_4_quarters)][["company_name", "quarter_label", rank_col]]
     pivot = subset.groupby(["company_name", "quarter_label"])[rank_col].mean().unstack()
     pivot = pivot.dropna(thresh=4)
@@ -487,8 +501,8 @@ st.markdown("<br>", unsafe_allow_html=True)
 rank_col    = RANK_METRICS[selected_metric_label]
 hib         = RANK_HIGHER_BETTER[selected_metric_label]
 
-delta_df    = compute_deltas(rank_col, current_q, prev_q)
-consist_df  = compute_consistency(rank_col, last_4)
+delta_df    = compute_deltas(rank_col, current_q, prev_q, DATA_PATH.stat().st_mtime if DATA_PATH.exists() else 0.0)
+consist_df  = compute_consistency(rank_col, last_4, DATA_PATH.stat().st_mtime if DATA_PATH.exists() else 0.0)
 
 rising_df   = delta_df.head(10)
 
