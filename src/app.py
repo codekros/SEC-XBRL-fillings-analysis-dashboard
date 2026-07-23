@@ -99,11 +99,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = PROJECT_ROOT / "data" / "processed" / "consolidated_kpis.parquet"
 
 @st.cache_data
-def load_financial_data():
-    if not DATA_PATH.exists():
+def load_financial_data(file_path: Path, mtime: float):
+    if not file_path.exists():
         st.error(f"Consolidated KPIs data file not found. Please run the consolidation script first.")
         st.stop()
-    df = pd.read_parquet(DATA_PATH)
+    df = pd.read_parquet(file_path)
+    
+    # Filter out companies missing >= 15 KPIs (SPACs, ETFs, IFRS, and inactive shell companies)
+    kpis = [
+        "revenue", "cost_of_revenue", "gross_profit", "operating_income", 
+        "depreciation_amortization", "income_before_tax", "net_income", 
+        "total_assets", "total_liabilities", "equity", "receivables", 
+        "payables", "inventory", "operating_cash_flow", "investing_cash_flow", 
+        "financing_cash_flow", "capex", "ebitda"
+    ]
+    kpis_present = [col for col in kpis if col in df.columns]
+    company_na_counts = df.groupby("company_name")[kpis_present].apply(lambda x: x.isna().all().sum())
+    valid_companies = company_na_counts[company_na_counts < 15].index
+    df = df[df["company_name"].isin(valid_companies)].copy()
+
     df["report_period"] = pd.to_datetime(df["report_period"])
     
     df["receivables"] = df["receivables"].fillna(0.0)
@@ -140,7 +154,7 @@ def load_financial_data():
         
     return df
 
-df = load_financial_data()
+df = load_financial_data(DATA_PATH, DATA_PATH.stat().st_mtime if DATA_PATH.exists() else 0.0)
 all_companies = sorted(df["company_name"].unique())
 
 FEATURE_COLUMNS_PRE = [
@@ -223,18 +237,80 @@ st.sidebar.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# --- DATA INTEGRITY PROFILE ---
+comp_name_upper = selected_company.upper()
+form_upper = str(latest_row['form_type']).upper()
+
+labels = []
+explanations = []
+
+is_etf = any(kw in comp_name_upper for kw in ["ETF", "TRUST", "FUND", "POOL", "GRANTOR"])
+is_ifrs = "20-F" in form_upper
+is_spac = any(kw in comp_name_upper for kw in ["ACQUISITION", "SPAC", "SHELL", "BLANK CHECK"])
+is_financial = any(kw in comp_name_upper for kw in ["BANK", "INSURANCE", "FINANCIAL", "INVESTMENT", "MUTUAL", "CAPITAL", "LENDING", "CREDIT", "SAVINGS"]) and not is_etf
+
+nan_cols = [col for col in ["revenue", "cost_of_revenue", "receivables", "payables", "inventory", "capex"] if col in latest_row.index and pd.isna(latest_row[col])]
+
+if is_etf:
+    labels.append("ETF / Investment Trust")
+    explanations.append("💼 **ETF/Trust:** Holds commodities (e.g. gold, crypto) or stock baskets, and does not have standard commercial operational revenues, inventory, cost of revenue, or capex.")
+elif is_ifrs:
+    labels.append("Foreign Private Issuer (IFRS)")
+    explanations.append("🌍 **IFRS Taxonomy:** Files using non-US GAAP standards. US GAAP metrics are mostly blank except shared tags like Assets.")
+elif is_spac:
+    labels.append("SPAC / Shell Entity")
+    explanations.append("🐚 **Shell / SPAC:** Pre-merger acquisition vehicle or inactive company with no standard commercial operations.")
+elif is_financial:
+    labels.append("Financial Institution")
+    explanations.append("🏦 **Financial Operations:** Banks and investment firms report interest/fee income rather than standard revenue/cost of sales, and do not carry physical inventory.")
+elif "inventory" in nan_cols:
+    labels.append("Service / Technology Firm")
+    explanations.append("💻 **Services/Software:** Naturally holds no physical inventory, which explains why the inventory metric is N/A.")
+
+if not labels:
+    labels.append("Standard Operating Corporation")
+
+if nan_cols:
+    expl = f"⚠️ **N/A Metrics:** {', '.join(nan_cols)} are N/A. "
+    if is_etf:
+        expl += "Expected due to trust structure."
+    elif is_ifrs:
+        expl += "Expected due to IFRS reporting."
+    elif is_spac:
+        expl += "Expected due to shell/SPAC status."
+    elif is_financial:
+        expl += "Expected due to banking/financial model."
+    elif "inventory" in nan_cols and len(nan_cols) == 1:
+        expl += "Expected due to service-oriented business."
+    else:
+        expl += "Due to non-standard or missing disclosures in raw SEC tables."
+    explanations.append(expl)
+else:
+    explanations.append("✅ **100% Data Integrity:** All core financial metrics are successfully populated.")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Data Integrity Profile")
+for label in labels:
+    st.sidebar.markdown(f"<span class='tag-highlight'>{label}</span>", unsafe_allow_html=True)
+st.sidebar.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+for exp in explanations:
+    st.sidebar.info(exp)
+
+
 peer_companies = [c for c in all_companies if c != selected_company]
 
 def get_derived_ratios(row):
-    rev = row["revenue"] if not pd.isna(row["revenue"]) and row["revenue"] != 0.0 else 1.0
+    rev = row["revenue"]
+    has_rev = not pd.isna(rev) and rev != 0.0
+    
     ebitda = row["ebitda"] if not pd.isna(row["ebitda"]) else 0.0
     ocf = row["operating_cash_flow"] if not pd.isna(row["operating_cash_flow"]) else None
     capex = row["capex"] if not pd.isna(row["capex"]) else None
     fcf = (ocf - capex) if ocf is not None and capex is not None else 0.0
     
-    g_margin = (row["gross_profit"] / rev * 100) if not pd.isna(row["gross_profit"]) else None
-    ebitda_margin = (ebitda / rev * 100) if not pd.isna(row["ebitda"]) else None
-    n_margin = (row["net_income"] / rev * 100) if not pd.isna(row["net_income"]) else None
+    g_margin = (row["gross_profit"] / rev * 100) if has_rev and not pd.isna(row["gross_profit"]) else None
+    ebitda_margin = (ebitda / rev * 100) if has_rev and not pd.isna(row["ebitda"]) else None
+    n_margin = (row["net_income"] / rev * 100) if has_rev and not pd.isna(row["net_income"]) else None
     
     equity = row["equity"]
     de = (row["total_liabilities"] / equity) if not pd.isna(equity) and equity != 0.0 and not pd.isna(row["total_liabilities"]) else None
@@ -245,7 +321,7 @@ def get_derived_ratios(row):
 
 
 @st.cache_data
-def build_history_df(company_df: pd.DataFrame) -> pd.DataFrame:
+def build_history_df(company_df: pd.DataFrame, mtime: float) -> pd.DataFrame:
     rows = []
     for _, row in company_df.iterrows():
         gm, em, nm, de, fcfc, fcf = get_derived_ratios(row)
@@ -310,7 +386,7 @@ with header_col1:
     """, unsafe_allow_html=True)
 
 with header_col2:
-    hist_df = build_history_df(company_df)
+    hist_df = build_history_df(company_df, DATA_PATH.stat().st_mtime if DATA_PATH.exists() else 0.0)
     csv_content = hist_df.to_csv(index=False).encode('utf-8')
     
     st.markdown("<div style='text-align: right; margin-top: 20px;'>", unsafe_allow_html=True)
@@ -830,7 +906,7 @@ with tab_ml:
     st.markdown("<div class='dashboard-section'>", unsafe_allow_html=True)
     st.markdown("### Historical Financial Statements Table")
     
-    hist_df_table = build_history_df(company_df)
+    hist_df_table = build_history_df(company_df, DATA_PATH.stat().st_mtime if DATA_PATH.exists() else 0.0)
     
     formatted_df = hist_df_table.copy()
     curr_cols = ["Revenue", "Total Assets", "Total Liabilities", "Equity", "Operating Cash Flow", "Free Cash Flow"]
